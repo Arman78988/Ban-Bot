@@ -18,7 +18,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # Ձեր Telegram user id (ադմինի համար)
-DB_PATH = "bot.db"
+DB_PATH = os.getenv("DB_PATH", "bot.db")  # Railway-ում՝ /data/bot.db (եթե Volume կա)
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
