@@ -168,13 +168,20 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer(
+    text = (
         "👋 Բարի գալուստ։\n\n"
-        "Այս բոտն ավտոմատ կերպով արգելափակում է այն օգտատերերին, ովքեր լքում են քո ալիքը "
+        "🛡 Այս բոտն ավտոմատ կերպով արգելափակում է այն օգտատերերին, ովքեր լքում են քո ալիքը "
         "(եթե բոտն ավելացված է որպես ադմին)։\n\n"
-        "Ընտրիր ցանկից՝",
-        reply_markup=main_menu_kb(message.from_user.id),
+        "📋 «Իմ ալիքները» — կառավարիր քո ալիքները (միացնել/անջատել, տես քո ալիքի "
+        "արգելափակումների քանակը)։\n"
     )
+    if message.from_user.id == OWNER_ID:
+        text += (
+            "📊 «Ընդհանուր վիճակագրություն» — միայն դու ես տեսնում, "
+            "թե ընդհանուր քանի ալիք է ներկայումս օգտագործում բոտը (որպես ադմին)։\n"
+        )
+    text += "\nԸնտրիր ցանկից՝"
+    await message.answer(text, reply_markup=main_menu_kb(message.from_user.id))
 
 
 @router.callback_query(F.data == "back_main")
@@ -215,12 +222,16 @@ async def render_channel_menu(callback: CallbackQuery, chat_id: int):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"Փոխարկել ({status})", callback_data=f"toggle_{chat_id}")],
-            [InlineKeyboardButton(text="📊 Վիճակագրություն", callback_data=f"stats_{chat_id}")],
+            [InlineKeyboardButton(text="📊 Այս ալիքի վիճակագրություն", callback_data=f"stats_{chat_id}")],
             [InlineKeyboardButton(text="⬅️ Հետ", callback_data="my_channels")],
         ]
     )
     await callback.message.edit_text(
-        f"Ալիք՝ {channel['chat_title']}\nԿարգավիճակ՝ {status}", reply_markup=kb
+        f"Ալիք՝ {channel['chat_title']}\n"
+        f"Կարգավիճակ՝ {status}\n\n"
+        f"ℹ️ «Փոխարկել» միացնում/անջատում է ավտոմատ արգելափակումը միայն այս ալիքի համար։\n"
+        f"ℹ️ «Վիճակագրություն»-ը ցույց է տալիս, թե քանի մարդ արդեն արգելափակվել է հենց այս ալիքից։",
+        reply_markup=kb,
     )
 
 
@@ -250,11 +261,16 @@ async def cb_stats(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_stats")
 async def cb_admin_stats(callback: CallbackQuery):
+    # Այս վիճակագրությունը երևում է ՄԻԱՅՆ OWNER_ID-ին՝ քանի ալիք ունի բոտն ընդհանուր առմամբ
+    # ադմին կարգավիճակով (ի տարբերություն "Վիճակագրություն"-ի, որը ցույց է տալիս
+    # յուրաքանչյուր օգտատիրոջ ՄԻԱՅՆ իր սեփական ալիքի արգելափակումների քանակը)։
     if callback.from_user.id != OWNER_ID:
         await callback.answer("Դու իրավունք չունես տեսնելու սա։", show_alert=True)
         return
     count = await count_active_channels()
-    await callback.answer(f"Բոտն ընդհանուր օգտագործվում է {count} ալիքում։", show_alert=True)
+    await callback.answer(
+        f"🤖 Բոտը ներկայումս ադմին է {count} ալիքում։", show_alert=True
+    )
 
 
 # ---------------------------------------------------------------------------
