@@ -4,7 +4,7 @@ import os
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import Command, ChatMemberUpdatedFilter, ADMINISTRATOR, IS_NOT_MEMBER
+from aiogram.filters import Command, ChatMemberUpdatedFilter, ADMINISTRATOR, IS_NOT_MEMBER, MEMBER
 from aiogram.types import (
     Message,
     ChatMemberUpdated,
@@ -19,6 +19,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # Ձեր Telegram user id (ադմինի համար)
 DB_PATH = os.getenv("DB_PATH", "bot.db")  # Railway-ում՝ /data/bot.db (եթե Volume կա)
+CHECK_INTERVAL_HOURS = int(os.getenv("CHECK_INTERVAL_HOURS", "6"))  # պարբերական ինքնաստուգում
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -38,25 +39,33 @@ async def init_db():
                 owner_id INTEGER,
                 enabled INTEGER DEFAULT 1,
                 banned_count INTEGER DEFAULT 0,
-                active INTEGER DEFAULT 1
+                active INTEGER DEFAULT 1,
+                can_ban INTEGER DEFAULT 0
             )
             """
         )
+        # Անվտանգ migration՝ եթե բազան ստեղծվել է ավելի հին տարբերակով
+        # (առանց can_ban սյունակի) — բոտի update-ից հետո տվյալները չեն կորչում
+        try:
+            await db.execute("ALTER TABLE channels ADD COLUMN can_ban INTEGER DEFAULT 0")
+        except Exception:
+            pass  # սյունակն արդեն գոյություն ունի
         await db.commit()
 
 
-async def upsert_channel(chat_id: int, chat_title: str, owner_id: int):
+async def upsert_channel(chat_id: int, chat_title: str, owner_id: int, can_ban: bool):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO channels (chat_id, chat_title, owner_id, enabled, active)
-            VALUES (?, ?, ?, 1, 1)
+            INSERT INTO channels (chat_id, chat_title, owner_id, enabled, active, can_ban)
+            VALUES (?, ?, ?, 1, 1, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 chat_title = excluded.chat_title,
                 owner_id = excluded.owner_id,
-                active = 1
+                active = 1,
+                can_ban = excluded.can_ban
             """,
-            (chat_id, chat_title, owner_id),
+            (chat_id, chat_title, owner_id, 1 if can_ban else 0),
         )
         await db.commit()
 
@@ -103,10 +112,76 @@ async def increment_ban_count(chat_id: int):
 
 
 async def count_active_channels() -> int:
+    # Հաշվում ենք ՄԻԱՅՆ այն ալիքները, որտեղ բոտը փաստացի ադմին է ԵՎ ունի
+    # արգելափակելու իրավունք — այլ ոչ բոլոր "ադմին նշված" ալիքները, որպեսզի
+    # OWNER-ի վիճակագրությունը ցույց տա իրապես աշխատող ալիքների քանակը
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM channels WHERE active = 1")
+        cur = await db.execute("SELECT COUNT(*) FROM channels WHERE active = 1 AND can_ban = 1")
         row = await cur.fetchone()
         return row[0]
+
+
+async def get_all_stored_channel_ids():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT chat_id FROM channels")
+        return [row[0] for row in await cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Իրական ստուգում Telegram API-ի միջոցով (ոչ միայն eventներով)
+# ---------------------------------------------------------------------------
+# Բազան ուղղորդվում է 2 եղանակով.
+#   1) Իրադարձություններով (my_chat_member) — իրական ժամանակում, երբ բոտին
+#      ադմին են դարձնում կամ հեռացնում
+#   2) Պարբերական ինքնաստուգումով (ստորև) — ստուգում է Telegram API-ից
+#      փաստացի կարգավիճակը, որպեսզի եթե բոտն անջատված է եղել update-ի պահին
+#      (redeploy, rebuild, պարբերաբար պատահող failure), տվյալները ինքնուրույն
+#      ուղղվեն, ոչ թե ընդմիշտ սխալ մնան
+async def verify_channel(bot: Bot, chat_id: int) -> bool:
+    """Ստուգում է ուղիղ Telegram API-ից՝ բոտն իրականում ադմին է այս ալիքում,
+    ԵՎ ունի՞ արգելափակելու իրավունք (can_restrict_members)։ Առանց այս իրավունքի
+    բոտը "ադմին" է թվում, բայց փաստացի չի կարող ոչ մեկին բլոկավորել՝ սա մեկ
+    սահմանափակում է, որը հաշվի ենք առնում։"""
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        is_admin = member.status == "administrator"
+        can_ban = bool(getattr(member, "can_restrict_members", False)) if is_admin else False
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE channels SET active = ?, can_ban = ? WHERE chat_id = ?",
+                (1 if is_admin else 0, 1 if can_ban else 0, chat_id),
+            )
+            await db.commit()
+
+        return is_admin and can_ban
+    except Exception:
+        # Ալիքը հասանելի չէ (բոտը հեռացված է, արգելափակված, ալիքը ջնջված է և այլն)
+        await set_channel_inactive(chat_id)
+        return False
+
+
+async def verify_all_channels(bot: Bot) -> int:
+    """Ստուգում է ԲՈԼՈՐ պահված ալիքները և վերադարձնում փաստացի ակտիվների քանակը։"""
+    chat_ids = await get_all_stored_channel_ids()
+    active = 0
+    for chat_id in chat_ids:
+        if await verify_channel(bot, chat_id):
+            active += 1
+    return active
+
+
+async def periodic_channel_check(bot: Bot):
+    """Ֆոնային ցիկլ, որը ամեն CHECK_INTERVAL_HOURS ժամը մեկ ինքնուրույն ստուգում է
+    բոլոր ալիքները, որպեսզի բացթողած update-երից հետո թիվը միշտ ճշգրիտ մնա։"""
+    while True:
+        await asyncio.sleep(CHECK_INTERVAL_HOURS * 3600)
+        try:
+            count = await verify_all_channels(bot)
+            logging.info(f"Պարբերական ստուգում ավարտվեց. ակտիվ ալիքներ՝ {count}")
+        except Exception as e:
+            logging.warning(f"Պարբերական ստուգման սխալ. {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -115,19 +190,38 @@ async def count_active_channels() -> int:
 
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=ADMINISTRATOR))
 async def on_bot_promoted(event: ChatMemberUpdated):
-    await upsert_channel(event.chat.id, event.chat.title or str(event.chat.id), event.from_user.id)
+    can_ban = bool(getattr(event.new_chat_member, "can_restrict_members", False))
+    await upsert_channel(
+        event.chat.id, event.chat.title or str(event.chat.id), event.from_user.id, can_ban
+    )
     try:
-        await event.bot.send_message(
-            event.from_user.id,
-            f"✅ Բոտը հաջողությամբ ավելացվեց որպես ադմին «{event.chat.title}» ալիքում։\n"
-            f"Ավտոմատ արգելափակումն այժմ ակտիվ է։ Կարգավորումների համար՝ /start",
-        )
+        if can_ban:
+            await event.bot.send_message(
+                event.from_user.id,
+                f"✅ Բոտը հաջողությամբ ավելացվեց որպես ադմին «{event.chat.title}» ալիքում։\n"
+                f"Ավտոմատ արգելափակումն այժմ ակտիվ է։ Կարգավորումների համար՝ /start",
+            )
+        else:
+            await event.bot.send_message(
+                event.from_user.id,
+                f"⚠️ Բոտն ավելացվեց «{event.chat.title}» ալիքում, բայց ՉՈՒՆԻ "
+                f"«Անդամներին սահմանափակել» իրավունքը, ուստի դեռ ՉԻ կարող ոչ ոքի "
+                f"արգելափակել։ Խնդրում ենք ադմինի կարգավորումներում միացնել այս իրավունքը։",
+            )
     except Exception:
         pass
 
 
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER))
 async def on_bot_removed(event: ChatMemberUpdated):
+    await set_channel_inactive(event.chat.id)
+
+
+@router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
+async def on_bot_demoted(event: ChatMemberUpdated):
+    # Բոտը մնում է ալիքում, բայց այլևս ադմին չէ (հանվել են իրավունքները) —
+    # սա նույնպես նշանակում է, որ բոտն այլևս չի կարող ֆունկցիոնալ աշխատել,
+    # ուստի հաշվում ենք որպես ոչ ակտիվ, մինչև նորից ադմին դառնա
     await set_channel_inactive(event.chat.id)
 
 
@@ -138,7 +232,7 @@ async def on_bot_removed(event: ChatMemberUpdated):
 @router.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER))
 async def on_member_left(event: ChatMemberUpdated):
     channel = await get_channel(event.chat.id)
-    if not channel or not channel["enabled"]:
+    if not channel or not channel["enabled"] or not channel["can_ban"]:
         return
 
     user = event.old_chat_member.user
@@ -285,6 +379,14 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Ամեն մեկնարկի ժամանակ (նաև redeploy-ից/update-ից հետո) իրական
+    # ստուգում ենք Telegram API-ից՝ ուղղելու ցանկացած բացթողած update
+    initial_count = await verify_all_channels(bot)
+    logging.info(f"Մեկնարկային ստուգում ավարտվեց. ֆունկցիոնալ ալիքներ՝ {initial_count}")
+
+    # Ֆոնային պարբերական ինքնաստուգում՝ շարունակական ճշգրտության համար
+    asyncio.create_task(periodic_channel_check(bot))
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(
