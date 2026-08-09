@@ -1,11 +1,14 @@
 import asyncio
 import logging
 import os
+from html import escape as esc
 
-import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, ChatMemberUpdatedFilter, ADMINISTRATOR, IS_NOT_MEMBER, MEMBER
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message,
     ChatMemberUpdated,
@@ -14,134 +17,101 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # Ձեր Telegram user id (ադմինի համար)
-DB_PATH = os.getenv("DB_PATH", "bot.db")  # Railway-ում՝ /data/bot.db (եթե Volume կա)
+MONGODB_URI = os.getenv("MONGODB_URI")  # MongoDB Atlas connection string
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "ban_bot")
 CHECK_INTERVAL_HOURS = int(os.getenv("CHECK_INTERVAL_HOURS", "6"))  # պարբերական ինքնաստուգում
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
 
 # ---------------------------------------------------------------------------
-# Database — մեկ ընդհանուր կապ (ոչ թե յուրաքանչյուր հարցման համար նոր կապ),
-# որպեսզի Railway-ի volume-ի հետ աշխատանքը արագ ու կայուն լինի, և
-# asyncio.Lock-ը երաշխավորում է, որ գրառումները չեն բախվում միմյանց հետ
+# Database — MongoDB Atlas (motor՝ async driver)։ Տվյալները պահվում են
+# Railway-ից ամբողջովին անկախ, ուստի Redeploy-ները/Update-ները ոչինչ չեն ջնջում
 # ---------------------------------------------------------------------------
 
-_db: aiosqlite.Connection | None = None
-_db_lock = asyncio.Lock()
+_mongo_client: AsyncIOMotorClient | None = None
+_channels = None  # MongoDB collection
 _bot_id: int | None = None
 
 
 async def init_db():
-    global _db
-    _db = await aiosqlite.connect(DB_PATH)
-    _db.row_factory = aiosqlite.Row
-    # WAL = ավելի արագ ու կայուն համաժամանակյա կարդալ/գրել աշխատանք
-    await _db.execute("PRAGMA journal_mode=WAL;")
-    await _db.execute("PRAGMA busy_timeout=5000;")
-    await _db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS channels (
-            chat_id INTEGER PRIMARY KEY,
-            chat_title TEXT,
-            owner_id INTEGER,
-            enabled INTEGER DEFAULT 1,
-            banned_count INTEGER DEFAULT 0,
-            active INTEGER DEFAULT 1,
-            can_ban INTEGER DEFAULT 0
-        )
-        """
-    )
-    try:
-        await _db.execute("ALTER TABLE channels ADD COLUMN can_ban INTEGER DEFAULT 0")
-    except Exception:
-        pass  # սյունակն արդեն գոյություն ունի (անվտանգ migration update-ների ժամանակ)
-    await _db.commit()
+    global _mongo_client, _channels
+    if not MONGODB_URI:
+        raise RuntimeError("MONGODB_URI չի գտնվել: Railway-ում պետք է սահմանել այս փոփոխականը!")
+    _mongo_client = AsyncIOMotorClient(MONGODB_URI)
+    db = _mongo_client[MONGODB_DB_NAME]
+    _channels = db["channels"]
+    await _channels.create_index("chat_id", unique=True)
+    await _channels.create_index("owner_id")
 
 
 async def close_db():
-    if _db:
-        await _db.close()
+    if _mongo_client:
+        _mongo_client.close()
 
 
 async def upsert_channel(chat_id: int, chat_title: str, owner_id: int, can_ban: bool):
-    async with _db_lock:
-        await _db.execute(
-            """
-            INSERT INTO channels (chat_id, chat_title, owner_id, enabled, active, can_ban)
-            VALUES (?, ?, ?, 1, 1, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                chat_title = excluded.chat_title,
-                owner_id = excluded.owner_id,
-                active = 1,
-                can_ban = excluded.can_ban
-            """,
-            (chat_id, chat_title, owner_id, 1 if can_ban else 0),
-        )
-        await _db.commit()
+    await _channels.update_one(
+        {"chat_id": chat_id},
+        {
+            "$set": {
+                "chat_title": chat_title,
+                "owner_id": owner_id,
+                "active": True,
+                "can_ban": can_ban,
+            },
+            "$setOnInsert": {"enabled": True, "banned_count": 0},
+        },
+        upsert=True,
+    )
 
 
 async def set_channel_status(chat_id: int, active: bool, can_ban: bool | None = None):
-    async with _db_lock:
-        if can_ban is None:
-            await _db.execute(
-                "UPDATE channels SET active = ? WHERE chat_id = ?", (1 if active else 0, chat_id)
-            )
-        else:
-            await _db.execute(
-                "UPDATE channels SET active = ?, can_ban = ? WHERE chat_id = ?",
-                (1 if active else 0, 1 if can_ban else 0, chat_id),
-            )
-        await _db.commit()
+    update = {"active": active}
+    if can_ban is not None:
+        update["can_ban"] = can_ban
+    await _channels.update_one({"chat_id": chat_id}, {"$set": update})
 
 
 async def get_channel(chat_id: int):
-    async with _db_lock:
-        cur = await _db.execute("SELECT * FROM channels WHERE chat_id = ?", (chat_id,))
-        return await cur.fetchone()
+    return await _channels.find_one({"chat_id": chat_id})
 
 
 async def get_user_channels(owner_id: int):
-    async with _db_lock:
-        cur = await _db.execute(
-            "SELECT * FROM channels WHERE owner_id = ? AND active = 1", (owner_id,)
-        )
-        return await cur.fetchall()
+    cursor = _channels.find({"owner_id": owner_id, "active": True})
+    return await cursor.to_list(length=200)
 
 
-async def toggle_channel(chat_id: int) -> int:
-    async with _db_lock:
-        cur = await _db.execute("SELECT enabled FROM channels WHERE chat_id = ?", (chat_id,))
-        row = await cur.fetchone()
-        new_val = 0 if row["enabled"] else 1
-        await _db.execute("UPDATE channels SET enabled = ? WHERE chat_id = ?", (new_val, chat_id))
-        await _db.commit()
-        return new_val
+async def toggle_channel(chat_id: int) -> bool:
+    channel = await _channels.find_one({"chat_id": chat_id})
+    new_val = not channel.get("enabled", True)
+    await _channels.update_one({"chat_id": chat_id}, {"$set": {"enabled": new_val}})
+    return new_val
 
 
 async def increment_ban_count(chat_id: int):
-    async with _db_lock:
-        await _db.execute(
-            "UPDATE channels SET banned_count = banned_count + 1 WHERE chat_id = ?", (chat_id,)
-        )
-        await _db.commit()
+    await _channels.update_one({"chat_id": chat_id}, {"$inc": {"banned_count": 1}})
 
 
 async def count_active_channels() -> int:
-    async with _db_lock:
-        cur = await _db.execute("SELECT COUNT(*) FROM channels WHERE active = 1 AND can_ban = 1")
-        row = await cur.fetchone()
-        return row[0]
+    return await _channels.count_documents({"active": True, "can_ban": True})
 
 
 async def get_all_stored_channel_ids():
-    async with _db_lock:
-        cur = await _db.execute("SELECT chat_id FROM channels")
-        return [row[0] for row in await cur.fetchall()]
+    cursor = _channels.find({}, {"chat_id": 1})
+    return [doc["chat_id"] async for doc in cursor]
+
+
+async def get_all_owner_ids():
+    """Ալիք-սեփականատերերի եզակի ID-ներ, որոնց ալիքում բոտն ընթացիկ ադմին է
+    (օգտագործվում է «Ուղարկել բոլորին» ֆունկցիայի համար)։"""
+    return await _channels.distinct("owner_id", {"active": True})
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +128,7 @@ async def get_bot_id(bot: Bot) -> int:
 
 async def safe_ban(bot: Bot, chat_id: int, user_id: int, retries: int = 3) -> bool:
     """Բանում է օգտատիրոջը, ինքնուրույն սպասելով, եթե Telegram-ը ժամանակավորապես
-    սահմանափակել է հարցումների արագությունը (flood control) — սա կանխում է
-    բոտի «կախվածությունը» ծանրաբեռնվածության ժամանակ։"""
+    սահմանափակել է հարցումների արագությունը (flood control)։"""
     for attempt in range(retries):
         try:
             await bot.ban_chat_member(chat_id, user_id)
@@ -173,16 +142,24 @@ async def safe_ban(bot: Bot, chat_id: int, user_id: int, retries: int = 3) -> bo
     return False
 
 
+async def safe_send(bot: Bot, user_id: int, text: str, retries: int = 2) -> bool:
+    """Ուղարկում է հաղորդագրություն flood-control-ի հանդեպ դիմացկուն կերպով,
+    օգտագործվում է broadcast-ի ժամանակ։"""
+    for attempt in range(retries):
+        try:
+            await bot.send_message(user_id, text)
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            return False
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Իրական ստուգում Telegram API-ի միջոցով (ոչ միայն eventներով)
 # ---------------------------------------------------------------------------
-# Բազան ուղղորդվում է 2 եղանակով.
-#   1) Իրադարձություններով (my_chat_member) — իրական ժամանակում, երբ բոտին
-#      ադմին են դարձնում կամ հեռացնում
-#   2) Պարբերական ինքնաստուգումով (ստորև) — ստուգում է Telegram API-ից
-#      փաստացի կարգավիճակը, որպեսզի եթե բոտն անջատված է եղել update-ի պահին
-#      (redeploy, rebuild, պարբերաբար պատահող failure), տվյալները ինքնուրույն
-#      ուղղվեն, ոչ թե ընդմիշտ սխալ մնան
+
 async def verify_channel(bot: Bot, chat_id: int) -> bool:
     try:
         bot_id = await get_bot_id(bot)
@@ -192,7 +169,6 @@ async def verify_channel(bot: Bot, chat_id: int) -> bool:
         await set_channel_status(chat_id, active=is_admin, can_ban=can_ban)
         return is_admin and can_ban
     except Exception:
-        # Ալիքը հասանելի չէ (բոտը հեռացված է, արգելափակված, ալիքը ջնջված է և այլն)
         await set_channel_status(chat_id, active=False, can_ban=False)
         return False
 
@@ -229,19 +205,22 @@ async def on_bot_promoted(event: ChatMemberUpdated):
     await upsert_channel(
         event.chat.id, event.chat.title or str(event.chat.id), event.from_user.id, can_ban
     )
+    title = esc(event.chat.title or str(event.chat.id))
     try:
         if can_ban:
             await event.bot.send_message(
                 event.from_user.id,
-                f"✅ Բոտը հաջողությամբ ավելացվեց որպես ադմին «{event.chat.title}» ալիքում։\n"
-                f"Ավտոմատ արգելափակումն այժմ ակտիվ է։ Կարգավորումների համար՝ /start",
+                f"✅ Բոտը հաջողությամբ ավելացվեց որպես ադմին «{title}» ալիքում։\n\n"
+                f"<blockquote>Ավտոմատ արգելափակումն այժմ ակտիվ է։ "
+                f"Կարգավորումների համար՝ /start</blockquote>",
             )
         else:
             await event.bot.send_message(
                 event.from_user.id,
-                f"⚠️ Բոտն ավելացվեց «{event.chat.title}» ալիքում, բայց ՉՈՒՆԻ "
-                f"«Անդամներին սահմանափակել» իրավունքը, ուստի դեռ ՉԻ կարող ոչ ոքի "
-                f"արգելափակել։ Խնդրում ենք ադմինի կարգավորումներում միացնել այս իրավունքը։",
+                f"⚠️ Բոտն ավելացվեց «{title}» ալիքում, բայց ՉՈՒՆԻ "
+                f"«Անդամներին սահմանափակել» իրավունքը։\n\n"
+                f"<blockquote>Դեռ ՉԻ կարող ոչ ոքի արգելափակել։ Խնդրում ենք ադմինի "
+                f"կարգավորումներում միացնել այս իրավունքը։</blockquote>",
             )
     except Exception:
         pass
@@ -254,24 +233,12 @@ async def on_bot_removed(event: ChatMemberUpdated):
 
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
 async def on_bot_demoted(event: ChatMemberUpdated):
-    # Բոտը մնում է ալիքում, բայց այլևս ադմին չէ (հանվել են իրավունքները) —
-    # հաշվում ենք որպես ոչ ֆունկցիոնալ, մինչև նորից ադմին դառնա
     await set_channel_status(event.chat.id, active=False, can_ban=False)
 
 
 # ---------------------------------------------------------------------------
 # Օգտատերը փաստացի լքում է ալիքը → արգելափակում
 # ---------------------------------------------------------------------------
-# ԿԱՐԵՎՈՐ. այստեղ ՈՉ ՄԻ ChatMemberUpdatedFilter հարմար չէ, քանի որ դրանք
-# հիմնվում են միայն նոր status-ի վրա։ Դա 2 սխալի պատճառ էր.
-#   1) Կրկնակի հաշվարկ. երբ բոտն ինքն է բանում է օգտատիրոջը, դա ինքնին
-#      ևս մեկ update է առաջացնում (left → kicked), որը կրկին համընկնում
-#      էր հին ֆիլտրի հետ և կրկնակի հաշվում էր։
-#   2) Ապաարգելափակման bug. երբ ադմինը ձեռքով հանում է oգտատիրոջը
-#      Blocked users ցուցակից, դա status-ը փոխում է kicked → left, ինչը
-#      հին ֆիլտրը սխալմամբ մեկնաբանում էր որպես «նոր լքում» և կրկին բանում։
-# Լուծումը՝ ինքներս ստուգել, որ հին կարգավիճակը եղել է ԻՐԱԿԱՆ անդամություն
-# (member/administrator/restricted-որպես-անդամ) և նոր կարգավիճակը left/kicked է։
 
 REAL_MEMBER_STATUSES = {"member", "administrator", "creator"}
 LEFT_STATUSES = {"left", "kicked"}
@@ -283,17 +250,16 @@ async def on_chat_member_update(event: ChatMemberUpdated):
     new_status = event.new_chat_member.status
 
     if old_status not in REAL_MEMBER_STATUSES or new_status not in LEFT_STATUSES:
-        return  # ban-list կառավարում, restricted-փոփոխություն և այլն — չենք արձագանքում
+        return
 
     channel = await get_channel(event.chat.id)
-    if not channel or not channel["enabled"] or not channel["can_ban"]:
+    if not channel or not channel.get("enabled") or not channel.get("can_ban"):
         return
 
     user = event.old_chat_member.user
     if user.is_bot:
         return
 
-    # Idempotency-ստուգում. եթե օգտատերն արդեն kicked է, չկրկնօրինակենք հաշվարկը
     try:
         current = await event.bot.get_chat_member(event.chat.id, user.id)
         if current.status == "kicked":
@@ -307,6 +273,98 @@ async def on_chat_member_update(event: ChatMemberUpdated):
 
 
 # ---------------------------------------------------------------------------
+# Broadcast (միայն OWNER_ID-ի համար) — հաղորդագրություն բոլոր ալիք-սեփականատերերին
+# ---------------------------------------------------------------------------
+
+class BroadcastStates(StatesGroup):
+    waiting_for_text = State()
+    confirm = State()
+
+
+@router.callback_query(F.data == "broadcast_start")
+async def cb_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("Դու իրավունք չունես տեսնելու սա։", show_alert=True)
+        return
+    await state.set_state(BroadcastStates.waiting_for_text)
+    await callback.message.edit_text(
+        "✍️ Գրիր տեքստը, որը կուղարկվի բոլոր ալիք-սեփականատերերին, ովքեր բոտն "
+        "ունեն որպես ադմին։\n\n"
+        "<blockquote>Չեղարկելու համար՝ /cancel</blockquote>",
+    )
+    await callback.answer()
+
+
+@router.message(BroadcastStates.waiting_for_text, Command("cancel"))
+async def cmd_cancel_broadcast(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Չեղարկվեց։", reply_markup=main_menu_kb(message.from_user.id))
+
+
+@router.message(BroadcastStates.waiting_for_text)
+async def process_broadcast_text(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+    text = message.html_text or esc(message.text or "")
+    await state.update_data(broadcast_text=text)
+    await state.set_state(BroadcastStates.confirm)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Ուղարկել", callback_data="broadcast_send")],
+            [InlineKeyboardButton(text="❌ Չեղարկել", callback_data="broadcast_cancel")],
+        ]
+    )
+    await message.answer(
+        f"<b>Նախադիտում</b>\n\n<blockquote>{text}</blockquote>\n\n"
+        f"Ուղարկե՞լ սա բոլոր ալիք-սեփականատերերին։",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "broadcast_cancel")
+async def cb_broadcast_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        "❌ Չեղարկվեց։", reply_markup=main_menu_kb(callback.from_user.id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast_send")
+async def cb_broadcast_send(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("Դու իրավունք չունես տեսնելու սա։", show_alert=True)
+        return
+
+    data = await state.get_data()
+    text = data.get("broadcast_text", "")
+    await state.clear()
+
+    if not text:
+        await callback.answer("Տեքստը դատարկ է։", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ Ուղարկվում է...")
+
+    owner_ids = await get_all_owner_ids()
+    sent, failed = 0, 0
+    for uid in owner_ids:
+        if await safe_send(callback.bot, uid, text):
+            sent += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)  # flood-control-ից խուսափելու համար
+
+    result_text = f"✅ Ուղարկվեց {sent} օգտատիրոջ։"
+    if failed:
+        result_text += f"\n⚠️ {failed} օգտատիրոջ չհասավ (հավանաբար արգելափակել են բոտը)։"
+
+    await callback.message.edit_text(result_text, reply_markup=main_menu_kb(callback.from_user.id))
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
 # Մասնավոր մենյու
 # ---------------------------------------------------------------------------
 
@@ -316,15 +374,19 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         rows.append(
             [InlineKeyboardButton(text="📊 Ընդհանուր վիճակագրություն", callback_data="admin_stats")]
         )
+        rows.append(
+            [InlineKeyboardButton(text="📨 Ուղարկել բոլորին", callback_data="broadcast_start")]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     text = (
-        "👋 Բարի գալուստ։\n\n"
-        "🛡 Այս բոտն ավտոմատ կերպով արգելափակում է այն օգտատերերին, ովքեր լքում են քո ալիքը "
-        "(եթե բոտն ավելացված է որպես ադմին)։\n\n"
+        "👋 <b>Բարի գալուստ</b>\n\n"
+        "<blockquote>🛡 Այս բոտն ավտոմատ կերպով արգելափակում է այն օգտատերերին, "
+        "ովքեր լքում են քո ալիքը (եթե բոտն ավելացված է որպես ադմին)։</blockquote>\n\n"
         "📋 «Իմ ալիքները» — կառավարիր քո ալիքները (միացնել/անջատել, տես քո ալիքի "
         "արգելափակումների քանակը)։\n"
     )
@@ -332,13 +394,15 @@ async def cmd_start(message: Message):
         text += (
             "📊 «Ընդհանուր վիճակագրություն» — միայն դու ես տեսնում, "
             "թե ընդհանուր քանի ալիք է ներկայումս օգտագործում բոտը (որպես ադմին)։\n"
+            "📨 «Ուղարկել բոլորին» — ուղարկիր հաղորդագրություն բոլոր ալիք-սեփականատերերին։\n"
         )
     text += "\nԸնտրիր ցանկից՝"
     await message.answer(text, reply_markup=main_menu_kb(message.from_user.id))
 
 
 @router.callback_query(F.data == "back_main")
-async def cb_back_main(callback: CallbackQuery):
+async def cb_back_main(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     await callback.message.edit_text(
         "Ընտրիր ցանկից՝", reply_markup=main_menu_kb(callback.from_user.id)
     )
@@ -350,7 +414,7 @@ async def cb_my_channels(callback: CallbackQuery):
     channels = await get_user_channels(callback.from_user.id)
     if not channels:
         await callback.message.edit_text(
-            "Դու դեռ ոչ մի ալիքում չես ավելացրել բոտը որպես ադմին։",
+            "<blockquote>Դու դեռ ոչ մի ալիքում չես ավելացրել բոտը որպես ադմին։</blockquote>",
             reply_markup=main_menu_kb(callback.from_user.id),
         )
         await callback.answer()
@@ -361,7 +425,9 @@ async def cb_my_channels(callback: CallbackQuery):
         for ch in channels
     ]
     rows.append([InlineKeyboardButton(text="⬅️ Հետ", callback_data="back_main")])
-    await callback.message.edit_text("Ընտրիր ալիքը՝", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.message.edit_text(
+        "Ընտրիր ալիքը՝", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
     await callback.answer()
 
 
@@ -371,7 +437,7 @@ async def render_channel_menu(callback: CallbackQuery, chat_id: int):
         await callback.answer("Ալիքը չի գտնվել։", show_alert=True)
         return
 
-    status = "🟢 Ակտիվ" if channel["enabled"] else "🔴 Անջատված"
+    status = "🟢 Ակտիվ" if channel.get("enabled") else "🔴 Անջատված"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"Փոխարկել ({status})", callback_data=f"toggle_{chat_id}")],
@@ -380,10 +446,11 @@ async def render_channel_menu(callback: CallbackQuery, chat_id: int):
         ]
     )
     await callback.message.edit_text(
-        f"Ալիք՝ {channel['chat_title']}\n"
+        f"Ալիք՝ {esc(channel['chat_title'])}\n"
         f"Կարգավիճակ՝ {status}\n\n"
-        f"ℹ️ «Փոխարկել» միացնում/անջատում է ավտոմատ արգելափակումը միայն այս ալիքի համար։\n"
-        f"ℹ️ «Վիճակագրություն»-ը ցույց է տալիս, թե քանի մարդ արդեն արգելափակվել է հենց այս ալիքից։",
+        f"<blockquote>ℹ️ «Փոխարկել» միացնում/անջատում է ավտոմատ արգելափակումը միայն "
+        f"այս ալիքի համար։\nℹ️ «Վիճակագրություն»-ը ցույց է տալիս, թե քանի մարդ արդեն "
+        f"արգելափակվել է հենց այս ալիքից։</blockquote>",
         reply_markup=kb,
     )
 
@@ -408,22 +475,17 @@ async def cb_stats(callback: CallbackQuery):
     chat_id = int(callback.data.split("_", 1)[1])
     channel = await get_channel(chat_id)
     await callback.answer(
-        f"Այս ալիքում արգելափակված է {channel['banned_count']} օգտատեր։", show_alert=True
+        f"Այս ալիքում արգելափակված է {channel.get('banned_count', 0)} օգտատեր։", show_alert=True
     )
 
 
 @router.callback_query(F.data == "admin_stats")
 async def cb_admin_stats(callback: CallbackQuery):
-    # Այս վիճակագրությունը երևում է ՄԻԱՅՆ OWNER_ID-ին՝ քանի ալիք ունի բոտն ընդհանուր առմամբ
-    # ֆունկցիոնալ ադմին կարգավիճակով (ի տարբերություն "Վիճակագրություն"-ի, որը ցույց է
-    # տալիս յուրաքանչյուր օգտատիրոջ ՄԻԱՅՆ իր սեփական ալիքի արգելափակումների քանակը)։
     if callback.from_user.id != OWNER_ID:
         await callback.answer("Դու իրավունք չունես տեսնելու սա։", show_alert=True)
         return
     count = await count_active_channels()
-    await callback.answer(
-        f"🤖 Բոտը ներկայումս ադմին է {count} ալիքում։", show_alert=True
-    )
+    await callback.answer(f"🤖 Բոտը ներկայումս ադմին է {count} ալիքում։", show_alert=True)
 
 
 # ---------------------------------------------------------------------------
@@ -435,17 +497,14 @@ async def main():
         raise RuntimeError("BOT_TOKEN չի գտնվել .env ֆայլում!")
 
     await init_db()
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
 
     try:
-        # Ամեն մեկնարկի ժամանակ (նաև redeploy-ից/update-ից հետո) իրական
-        # ստուգում ենք Telegram API-ից՝ ուղղելու ցանկացած բացթողած update
         initial_count = await verify_all_channels(bot)
         logging.info(f"Մեկնարկային ստուգում ավարտվեց. ֆունկցիոնալ ալիքներ՝ {initial_count}")
 
-        # Ֆոնային պարբերական ինքնաստուգում՝ շարունակական ճշգրտության համար
         asyncio.create_task(periodic_channel_check(bot))
 
         await bot.delete_webhook(drop_pending_updates=True)
