@@ -31,6 +31,37 @@ logging.basicConfig(level=logging.INFO)
 router = Router()
 
 # ---------------------------------------------------------------------------
+# Premium emoji-ներ (HTML tg-emoji tag)։ Ոչ-Premium օգտատերերը կտեսնեն
+# փակագծերում նշված սովորական էմոջին որպես fallback։
+# ---------------------------------------------------------------------------
+
+EMOJI_WAVE = '<tg-emoji emoji-id="5472055112702629499">👋</tg-emoji>'
+EMOJI_SHIELD = '<tg-emoji emoji-id="5778423822940114949">🛡</tg-emoji>'
+EMOJI_CHECK = '<tg-emoji emoji-id="5325538810275055890">✅</tg-emoji>'
+
+# ---------------------------------------------------------------------------
+# Հին մենյու/հաղորդագրություններն ինքնաշխատ ջնջելու համար (user_id → message_id)։
+# Երբ նոր հրաման/ընտրություն է գալիս, նախորդ բոտի հաղորդագրությունը ջնջվում է,
+# որպեսզի զրույցում հին էկրանները կուտակված չմնան։
+# ---------------------------------------------------------------------------
+
+_last_menu_msg: dict[int, int] = {}
+
+
+def _remember(user_id: int, message: Message):
+    _last_menu_msg[user_id] = message.message_id
+
+
+async def _clear_old(bot: Bot, user_id: int):
+    msg_id = _last_menu_msg.pop(user_id, None)
+    if msg_id:
+        try:
+            await bot.delete_message(user_id, msg_id)
+        except Exception:
+            pass  # հաղորդագրությունն արդեն ջնջված է կամ չափազանց հին է
+
+
+# ---------------------------------------------------------------------------
 # Database — MongoDB Atlas (motor՝ async driver)։ Տվյալները պահվում են
 # Railway-ից ամբողջովին անկախ, ուստի Redeploy-ները/Update-ները ոչինչ չեն ջնջում
 # ---------------------------------------------------------------------------
@@ -210,7 +241,7 @@ async def on_bot_promoted(event: ChatMemberUpdated):
         if can_ban:
             await event.bot.send_message(
                 event.from_user.id,
-                f"✅ Բոտը հաջողությամբ ավելացվեց որպես ադմին «{title}» ալիքում։\n\n"
+                f"{EMOJI_CHECK} Բոտը հաջողությամբ ավելացվեց որպես ադմին «{title}» ալիքում։\n\n"
                 f"<blockquote>Ավտոմատ արգելափակումն այժմ ակտիվ է։ "
                 f"Կարգավորումների համար՝ /start</blockquote>",
             )
@@ -292,13 +323,16 @@ async def cb_broadcast_start(callback: CallbackQuery, state: FSMContext):
         "ունեն որպես ադմին։\n\n"
         "<blockquote>Չեղարկելու համար՝ /cancel</blockquote>",
     )
+    _remember(callback.from_user.id, callback.message)
     await callback.answer()
 
 
 @router.message(BroadcastStates.waiting_for_text, Command("cancel"))
 async def cmd_cancel_broadcast(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Չեղարկվեց։", reply_markup=main_menu_kb(message.from_user.id))
+    await _clear_old(message.bot, message.from_user.id)
+    sent = await message.answer("❌ Չեղարկվեց։", reply_markup=main_menu_kb(message.from_user.id))
+    _remember(message.from_user.id, sent)
 
 
 @router.message(BroadcastStates.waiting_for_text)
@@ -315,11 +349,13 @@ async def process_broadcast_text(message: Message, state: FSMContext):
             [InlineKeyboardButton(text="❌ Չեղարկել", callback_data="broadcast_cancel")],
         ]
     )
-    await message.answer(
+    await _clear_old(message.bot, message.from_user.id)
+    sent = await message.answer(
         f"<b>Նախադիտում</b>\n\n<blockquote>{text}</blockquote>\n\n"
         f"Ուղարկե՞լ սա բոլոր ալիք-սեփականատերերին։",
         reply_markup=kb,
     )
+    _remember(message.from_user.id, sent)
 
 
 @router.callback_query(F.data == "broadcast_cancel")
@@ -328,6 +364,7 @@ async def cb_broadcast_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "❌ Չեղարկվեց։", reply_markup=main_menu_kb(callback.from_user.id)
     )
+    _remember(callback.from_user.id, callback.message)
     await callback.answer()
 
 
@@ -356,11 +393,12 @@ async def cb_broadcast_send(callback: CallbackQuery, state: FSMContext):
             failed += 1
         await asyncio.sleep(0.05)  # flood-control-ից խուսափելու համար
 
-    result_text = f"✅ Ուղարկվեց {sent} օգտատիրոջ։"
+    result_text = f"{EMOJI_CHECK} Ուղարկվեց {sent} օգտատիրոջ։"
     if failed:
         result_text += f"\n⚠️ {failed} օգտատիրոջ չհասավ (հավանաբար արգելափակել են բոտը)։"
 
     await callback.message.edit_text(result_text, reply_markup=main_menu_kb(callback.from_user.id))
+    _remember(callback.from_user.id, callback.message)
     await callback.answer()
 
 
@@ -383,19 +421,29 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    await _clear_old(message.bot, message.from_user.id)
+
+    username_display = (
+        f"@{esc(message.from_user.username)}"
+        if message.from_user.username
+        else esc(message.from_user.full_name)
+    )
     text = (
-        "👋 <b>Բարի գալուստ</b>\n\n"
-        "<blockquote>🛡 Այս բոտն ավտոմատ կերպով արգելափակում է այն օգտատերերին, "
+        f"{EMOJI_WAVE} Բարև, <b>{username_display}</b>\n\n"
+        f"<blockquote>{EMOJI_SHIELD} Այս բոտն ավտոմատ կերպով արգելափակում է այն օգտատերերին, "
         "ովքեր լքում են քո ալիքը (եթե բոտն ավելացված է որպես ադմին)։</blockquote>\n\n"
         "📋 «Իմ ալիքները» — կառավարիր քո ալիքները (միացնել/անջատել, տես քո ալիքի "
         "արգելափակումների քանակը)։\n"
     )
     if message.from_user.id == OWNER_ID:
         text += (
+            "📊 «Ընդհանուր վիճակագրություն» — միայն դու ես տեսնում, "
+            "թե ընդհանուր քանի ալիք է ներկայումս օգտագործում բոտը (որպես ադմին)։\n"
             "📨 «Ուղարկել բոլորին» — ուղարկիր հաղորդագրություն բոլոր ալիք-սեփականատերերին։\n"
         )
     text += "\nԸնտրիր ցանկից՝"
-    await message.answer(text, reply_markup=main_menu_kb(message.from_user.id))
+    sent = await message.answer(text, reply_markup=main_menu_kb(message.from_user.id))
+    _remember(message.from_user.id, sent)
 
 
 @router.callback_query(F.data == "back_main")
@@ -404,6 +452,7 @@ async def cb_back_main(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "Ընտրիր ցանկից՝", reply_markup=main_menu_kb(callback.from_user.id)
     )
+    _remember(callback.from_user.id, callback.message)
     await callback.answer()
 
 
@@ -415,6 +464,7 @@ async def cb_my_channels(callback: CallbackQuery):
             "<blockquote>Դու դեռ ոչ մի ալիքում չես ավելացրել բոտը որպես ադմին։</blockquote>",
             reply_markup=main_menu_kb(callback.from_user.id),
         )
+        _remember(callback.from_user.id, callback.message)
         await callback.answer()
         return
 
@@ -426,6 +476,7 @@ async def cb_my_channels(callback: CallbackQuery):
     await callback.message.edit_text(
         "Ընտրիր ալիքը՝", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
+    _remember(callback.from_user.id, callback.message)
     await callback.answer()
 
 
@@ -451,6 +502,7 @@ async def render_channel_menu(callback: CallbackQuery, chat_id: int):
         f"արգելափակվել է հենց այս ալիքից։</blockquote>",
         reply_markup=kb,
     )
+    _remember(callback.from_user.id, callback.message)
 
 
 @router.callback_query(F.data.startswith("chan_"))
